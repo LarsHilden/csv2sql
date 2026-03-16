@@ -2,7 +2,7 @@
 """
 CSV to PostgreSQL SQL converter.
 
-Do not remove this pseudocode block. When changing program behaviour, update this
+Do not remove this pseudocode block. Whenever the program code changes, update this
 docstring so the pseudocode stays aligned with the implementation.
 
 Pseudo code
@@ -59,6 +59,10 @@ MAIN
         column_names = column_names,
         column_profiles = column_profiles
     )
+    index_definitions = build_index_definitions(
+        requested_indexes = args.index,
+        column_names = column_names
+    )
 
     sql_parts = []
     if args.drop_before_create == yes and args.create_table == yes
@@ -72,13 +76,21 @@ MAIN
             pk_definition = pk_definition,
             auto_pk = args.auto_pk
         ))
+        sql_parts.extend(generate_index_sql(args.table, index_definitions))
 
     if args.truncate_before_insert == yes and args.insert_table == yes
         sql_parts.append(generate_truncate_table_sql(args.table))
 
     if args.insert_table == yes
         if args.insert_mode == "insert"
-            sql_parts.append(generate_insert_statements(...))
+            sql_parts.append(generate_insert_statements(
+                table_name = args.table,
+                column_names = column_names,
+                inferred_types = inferred_types,
+                data_rows = data_rows,
+                null_tokens = args.null_tokens,
+                batch_size = args.batch
+            ))
         else if args.insert_mode == "copy"
             sql_parts.append(generate_copy_block(...))
 
@@ -195,6 +207,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--encoding", default="auto", help="Encoding: auto|utf-8|utf-8-sig|cp1252")
     parser.add_argument("--text-mode", choices=("text", "varchar"), default="text")
     parser.add_argument("--insert-mode", choices=("insert", "copy"), default="insert")
+    parser.add_argument("--batch", type=int, help="Rows per INSERT statement when --insert-mode insert.")
+    parser.add_argument(
+        "--index",
+        action="append",
+        nargs="+",
+        metavar="COLUMN",
+        help="Create an index on one or more normalized column names. Repeat for multiple indexes.",
+    )
     parser.add_argument("--null-tokens", nargs="*", default=["", "NULL", "null"])
     parser.add_argument("--postgres-host")
     parser.add_argument("--postgres-port", type=int, default=5432)
@@ -231,6 +251,31 @@ def validate_arguments(args: argparse.Namespace) -> None:
         raise ValueError("--truncate-before-insert requires --insert-table yes")
     if args.create_table != "yes" and args.insert_table != "yes":
         raise ValueError("Nothing to do: enable --create-table and/or --insert-table")
+    if args.batch is not None and args.batch < 1:
+        raise ValueError("--batch must be a positive integer")
+    if args.batch is not None and args.insert_mode != "insert":
+        raise ValueError("--batch is only supported with --insert-mode insert")
+
+
+def build_index_definitions(
+    requested_indexes: list[list[str]] | None,
+    column_names: list[str],
+) -> list[tuple[str, ...]]:
+    if not requested_indexes:
+        return []
+    column_set = set(column_names)
+    normalized_indexes: list[tuple[str, ...]] = []
+    for index_columns in requested_indexes:
+        if not index_columns:
+            continue
+        missing = [column for column in index_columns if column not in column_set]
+        if missing:
+            raise ValueError(
+                f"Index column(s) not found: {', '.join(missing)}. "
+                f"Use normalized names: {', '.join(column_names)}"
+            )
+        normalized_indexes.append(tuple(index_columns))
+    return normalized_indexes
 
 
 def normalize_cli_csv_options(delimiter: str, quote_char: str) -> tuple[str, str]:
@@ -542,22 +587,48 @@ def generate_create_table_sql(
     return "\n".join(lines)
 
 
+def generate_index_sql(table_name: str, index_definitions: list[tuple[str, ...]]) -> list[str]:
+    statements: list[str] = []
+    for index_columns in index_definitions:
+        index_name = build_index_name(table_name, index_columns)
+        columns_sql = ", ".join(quote_identifier(column) for column in index_columns)
+        statements.append(
+            f"CREATE INDEX IF NOT EXISTS {quote_identifier(index_name)} "
+            f"ON {format_table_name(table_name)} ({columns_sql});"
+        )
+    return statements
+
+
+def build_index_name(table_name: str, index_columns: tuple[str, ...]) -> str:
+    base_table_name = table_name.split(".")[-1].strip()
+    safe_table_name = re.sub(r"[^a-zA-Z0-9_]+", "_", base_table_name).strip("_") or "table"
+    raw_name = f"idx_{safe_table_name}_{'_'.join(index_columns)}"
+    return raw_name[:63]
+
+
 def generate_insert_statements(
     table_name: str,
     column_names: list[str],
     inferred_types: list[str],
     data_rows: list[list[str]],
     null_tokens: set[str],
+    batch_size: int | None,
 ) -> str:
     quoted_columns = ", ".join(quote_identifier(name) for name in column_names)
     statements: list[str] = []
-    for row in data_rows:
-        values = [
-            sql_literal(cell, inferred_type, null_tokens)
-            for cell, inferred_type in zip(row, inferred_types)
-        ]
+    batch_size = batch_size or 1
+    for start in range(0, len(data_rows), batch_size):
+        batch_rows = data_rows[start:start + batch_size]
+        values_sql: list[str] = []
+        for row in batch_rows:
+            values = [
+                sql_literal(cell, inferred_type, null_tokens)
+                for cell, inferred_type in zip(row, inferred_types)
+            ]
+            values_sql.append(f"({', '.join(values)})")
         statements.append(
-            f"INSERT INTO {format_table_name(table_name)} ({quoted_columns}) VALUES ({', '.join(values)});"
+            f"INSERT INTO {format_table_name(table_name)} ({quoted_columns}) VALUES\n"
+            f"    {',\n    '.join(values_sql)};"
         )
     return "\n".join(statements)
 
@@ -736,6 +807,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         column_names,
         column_profiles,
     )
+    index_definitions = build_index_definitions(args.index, column_names)
 
     sql_parts: list[str] = []
     if args.drop_before_create == "yes" and args.create_table == "yes":
@@ -751,6 +823,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 column_profiles,
             )
         )
+        sql_parts.extend(generate_index_sql(args.table, index_definitions))
     if args.truncate_before_insert == "yes" and args.insert_table == "yes":
         sql_parts.append(generate_truncate_table_sql(args.table))
     if args.insert_table == "yes":
@@ -762,6 +835,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     inferred_types,
                     data_rows,
                     null_tokens,
+                    args.batch,
                 )
             )
         else:
