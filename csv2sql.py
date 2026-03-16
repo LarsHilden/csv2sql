@@ -17,6 +17,7 @@ MAIN
         args.input,
         args.encoding
     )
+    input_text = convert_input_to_internal_text(input_text, detected_encoding)
 
     csv_dialect = detect_csv_dialect(
         input_text,
@@ -25,6 +26,9 @@ MAIN
     )
 
     rows = parse_csv_to_list_of_lists(input_text, csv_dialect)
+    # Keep the full dataset in memory so type inference sees every value before
+    # SQL generation. This avoids under-sized numeric definitions that can fail
+    # later with PostgreSQL numeric overflow during import.
     if rows is empty
         raise error "Input file contains no data"
 
@@ -48,6 +52,8 @@ MAIN
             update_candidate_type_stats(column_profiles[column_index], normalized_value)
             update_numeric_precision_stats(column_profiles[column_index], normalized_value)
             update_uniqueness_stats(column_profiles[column_index], normalized_value)
+    # Decimal precision must consider the widest left side and widest right side
+    # seen anywhere in the column before choosing NUMERIC(p,s).
 
     inferred_types = []
     for each profile in column_profiles
@@ -204,7 +210,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--truncate-before-insert", choices=("yes", "no"), default="no")
     parser.add_argument("--delimiter", default="auto", help='Delimiter: auto|,|;|\\t||')
     parser.add_argument("--quote-char", default="auto", help='Quote char: auto|"')
-    parser.add_argument("--encoding", default="auto", help="Encoding: auto|utf-8|utf-8-sig|cp1252")
+    parser.add_argument(
+        "--encoding",
+        default="auto",
+        help="Encoding: auto|utf-8|utf-8-sig|utf-16|utf-16-le|utf-16-be|cp1252",
+    )
     parser.add_argument("--text-mode", choices=("text", "varchar"), default="text")
     parser.add_argument("--insert-mode", choices=("insert", "copy"), default="insert")
     parser.add_argument("--batch", type=int, help="Rows per INSERT statement when --insert-mode insert.")
@@ -284,16 +294,43 @@ def normalize_cli_csv_options(delimiter: str, quote_char: str) -> tuple[str, str
     return delimiter_map.get(delimiter, delimiter), quote_map.get(quote_char, quote_char)
 
 
+def detect_bom_encoding(raw: bytes) -> str | None:
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return "utf-16"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    return None
+
+
 def read_file_with_encoding_detection(path: str, encoding: str) -> tuple[str, str]:
     raw = Path(path).read_bytes()
-    candidates = [encoding] if encoding != "auto" else ["utf-8-sig", "utf-8", "cp1252"]
+    bom_encoding = detect_bom_encoding(raw)
+    candidates: list[str] = []
+    if encoding != "auto":
+        candidates.append(encoding)
+    else:
+        if bom_encoding:
+            candidates.append(bom_encoding)
+        candidates.extend(["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252"])
+
     last_error = None
+    seen: set[str] = set()
     for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             return raw.decode(candidate), candidate
         except UnicodeDecodeError as exc:
             last_error = exc
     raise ValueError(f"Could not decode {path}: {last_error}")
+
+
+def convert_input_to_internal_text(text: str, detected_encoding: str) -> str:
+    # Decoding produces internal Unicode text before dialect detection and analysis.
+    if detected_encoding.startswith("utf-16") and text.startswith("\ufeff"):
+        return text.lstrip("\ufeff")
+    return text
 
 
 def detect_csv_dialect(text: str, delimiter_arg: str, quote_char_arg: str) -> CsvDialectInfo:
@@ -495,7 +532,11 @@ def infer_postgres_type(profile: ColumnProfile, text_mode: str) -> str:
         return f"NUMERIC({max(profile.max_total_digits, 1)},0)"
 
     if profile.matches_decimal and not (profile.saw_decimal_comma and profile.saw_decimal_dot):
-        precision = max(profile.max_total_digits, 1)
+        precision = max(
+            profile.max_total_digits,
+            profile.max_digits_left_of_decimal + profile.max_digits_right_of_decimal,
+            1,
+        )
         scale = profile.max_digits_right_of_decimal
         return f"NUMERIC({precision},{scale})"
 
@@ -780,9 +821,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     validate_arguments(args)
     args.delimiter, args.quote_char = normalize_cli_csv_options(args.delimiter, args.quote_char)
 
-    input_text, _detected_encoding = read_file_with_encoding_detection(args.input, args.encoding)
+    input_text, detected_encoding = read_file_with_encoding_detection(args.input, args.encoding)
+    input_text = convert_input_to_internal_text(input_text, detected_encoding)
     csv_dialect = detect_csv_dialect(input_text, args.delimiter, args.quote_char)
     rows = parse_csv_to_list_of_lists(input_text, csv_dialect)
+    # Full-column analysis is intentional: infer types from all values before
+    # emitting CREATE TABLE / INSERT / COPY SQL to avoid import-time overflows.
     if not rows:
         raise ValueError("Input file contains no data")
 
