@@ -13,31 +13,19 @@ MAIN
     validate_arguments(args)
     args.delimiter, args.quote_char = normalize_cli_csv_options(args.delimiter, args.quote_char)
 
-    input_text, detected_encoding = read_file_with_encoding_detection(
-        args.input,
-        args.encoding
+    raw_headers, data_rows = load_rows_from_input_files(
+        input_paths = args.input,
+        encoding = args.encoding,
+        delimiter_arg = args.delimiter,
+        quote_char_arg = args.quote_char,
+        has_header = args.has_header
     )
-    input_text = convert_input_to_internal_text(input_text, detected_encoding)
-
-    csv_dialect = detect_csv_dialect(
-        input_text,
-        preferred_delimiters = [",", ";", "\\t", "|"],
-        preferred_quote_chars = ['"']
-    )
-
-    rows = parse_csv_to_list_of_lists(input_text, csv_dialect)
-    # Keep the full dataset in memory so type inference sees every value before
-    # SQL generation. This avoids under-sized numeric definitions that can fail
-    # later with PostgreSQL numeric overflow during import.
-    if rows is empty
-        raise error "Input file contains no data"
-
-    if args.has_header == yes
-        raw_headers = rows[0]
-        data_rows = rows[1:]
-    else
-        raw_headers = generate_headers_from_first_data_row(rows[0])
-        data_rows = rows
+    # Keep the full dataset from all files in memory so type inference sees
+    # every value before SQL generation. This avoids under-sized numeric
+    # definitions that can fail later with PostgreSQL numeric overflow during
+    # import.
+    if raw_headers is empty
+        raise error "Input file contains no columns"
 
     column_names = normalize_sql_column_names(raw_headers)
     validate_column_count_consistency(data_rows, expected_count = len(column_names))
@@ -197,7 +185,12 @@ class ColumnProfile:
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert CSV data to PostgreSQL SQL.")
-    parser.add_argument("--input", required=True, help="Path to input CSV file.")
+    parser.add_argument(
+        "--input",
+        required=True,
+        nargs="+",
+        help="One or more input CSV files.",
+    )
     parser.add_argument("--target", choices=("screen", "file", "execute"), default="screen")
     parser.add_argument("--output", help="Output .sql path when --target file.")
     parser.add_argument("--table", required=True, help="Target table name, optionally schema-qualified.")
@@ -372,15 +365,82 @@ def parse_csv_to_list_of_lists(text: str, dialect: CsvDialectInfo) -> list[list[
     return [list(row) for row in reader]
 
 
+def load_rows_from_input_files(
+    input_paths: list[str],
+    encoding: str,
+    delimiter_arg: str,
+    quote_char_arg: str,
+    has_header: str,
+) -> tuple[list[str], list[list[str]]]:
+    combined_headers: list[str] | None = None
+    combined_data_rows: list[list[str]] = []
+
+    for input_path in input_paths:
+        input_text, detected_encoding = read_file_with_encoding_detection(input_path, encoding)
+        input_text = convert_input_to_internal_text(input_text, detected_encoding)
+        csv_dialect = detect_csv_dialect(input_text, delimiter_arg, quote_char_arg)
+        rows = parse_csv_to_list_of_lists(input_text, csv_dialect)
+        if not rows:
+            raise ValueError(f"Input file contains no data: {input_path}")
+
+        if has_header == "yes":
+            file_headers = rows[0]
+            file_data_rows = rows[1:]
+        else:
+            file_headers = generate_headers_from_first_data_row(rows[0])
+            file_data_rows = rows
+
+        if combined_headers is None:
+            combined_headers = file_headers
+        else:
+            validate_matching_headers(combined_headers, file_headers, input_path)
+        validate_column_count_consistency(file_data_rows, len(file_headers))
+        combined_data_rows.extend(file_data_rows)
+
+    if combined_headers is None:
+        raise ValueError("No input files were provided")
+    return combined_headers, combined_data_rows
+
+
+def validate_matching_headers(
+    expected_headers: list[str],
+    candidate_headers: list[str],
+    input_path: str,
+) -> None:
+    if len(candidate_headers) != len(expected_headers):
+        raise ValueError(
+            f"Header column count mismatch in {input_path}: "
+            f"expected {len(expected_headers)}, got {len(candidate_headers)}"
+        )
+    if normalize_sql_column_names(candidate_headers) != normalize_sql_column_names(expected_headers):
+        raise ValueError(
+            f"Header mismatch in {input_path}: expected columns compatible with "
+            f"{expected_headers}, got {candidate_headers}"
+        )
+
+
 def generate_headers_from_first_data_row(first_row: list[str]) -> list[str]:
     return [f"col_{index + 1}" for index in range(len(first_row))]
+
+
+def transliterate_norwegian_letters(value: str) -> str:
+    translation_table = str.maketrans({
+        "Æ": "AE",
+        "Ø": "OE",
+        "Å": "AA",
+        "æ": "ae",
+        "ø": "oe",
+        "å": "aa",
+    })
+    return value.translate(translation_table)
 
 
 def normalize_sql_column_names(headers: list[str]) -> list[str]:
     normalized: list[str] = []
     seen: Counter[str] = Counter()
     for index, header in enumerate(headers, start=1):
-        name = re.sub(r"[^a-zA-Z0-9_]+", "_", header.strip().lower())
+        name = transliterate_norwegian_letters(header.strip()).lower()
+        name = re.sub(r"[^a-zA-Z0-9_]+", "_", name)
         name = re.sub(r"_+", "_", name).strip("_")
         if not name:
             name = f"col_{index}"
@@ -821,22 +881,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     validate_arguments(args)
     args.delimiter, args.quote_char = normalize_cli_csv_options(args.delimiter, args.quote_char)
 
-    input_text, detected_encoding = read_file_with_encoding_detection(args.input, args.encoding)
-    input_text = convert_input_to_internal_text(input_text, detected_encoding)
-    csv_dialect = detect_csv_dialect(input_text, args.delimiter, args.quote_char)
-    rows = parse_csv_to_list_of_lists(input_text, csv_dialect)
-    # Full-column analysis is intentional: infer types from all values before
-    # emitting CREATE TABLE / INSERT / COPY SQL to avoid import-time overflows.
-    if not rows:
-        raise ValueError("Input file contains no data")
-
-    if args.has_header == "yes":
-        raw_headers = rows[0]
-        data_rows = rows[1:]
-    else:
-        raw_headers = generate_headers_from_first_data_row(rows[0])
-        data_rows = rows
-
+    raw_headers, data_rows = load_rows_from_input_files(
+        args.input,
+        args.encoding,
+        args.delimiter,
+        args.quote_char,
+        args.has_header,
+    )
     if not raw_headers:
         raise ValueError("Input file contains no columns")
 
